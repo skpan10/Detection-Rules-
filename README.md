@@ -1,5 +1,10 @@
 # 🛡️ Detection Rules Repository
 
+![CI](https://github.com/skpan10/Detection-Rules-/actions/workflows/validate-rules.yml/badge.svg)
+![Rules](https://img.shields.io/badge/rules-7%20KQL-blue)
+![MITRE](https://img.shields.io/badge/MITRE%20ATT%26CK-mapped-red)
+![Platform](https://img.shields.io/badge/platform-Microsoft%20Sentinel-0078D4)
+
 > Threat detection rules for Microsoft Defender + Azure AD environments, built around attacker chain logic to minimize false positives.
 
 ## 📁 Repository Structure
