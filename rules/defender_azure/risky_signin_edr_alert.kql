@@ -1,0 +1,124 @@
+// ============================================================
+// RULE: Azure AD Risky Sign-in Correlated with Defender EDR Alert
+// ============================================================
+// MITRE ATT&CK: T1078 (Valid Accounts) + T1566 (Phishing) -> T1059
+// Severity: High
+// Version: 1.0
+//
+// ATTACKER CHAIN LOGIC:
+//   1. Azure AD Identity Protection flags a risky sign-in
+//      (impossible travel, leaked credentials, malware-linked IP, etc.)
+//   2. Within the same session window, a Defender for Endpoint alert fires
+//      on the same user's device (malware, suspicious script, etc.)
+//   3. Combined = confirmed compromise, not just a risky login anomaly
+//
+// WHY THIS REDUCES FALSE POSITIVES:
+//   - Risky sign-ins alone have ~40% FP rate (VPNs, travel, new device)
+//   - Defender alerts alone on a device might be pre-existing unrelated malware
+//   - BOTH together on SAME user within short window = high confidence
+// ============================================================
+
+let CorrelationWindow = 4h;
+let HighRiskSigninCategories = dynamic([
+    "maliciousIPAddress",
+    "unfamiliarFeatures",
+    "anonymizedIPAddress",
+    "malwareLinkedIPAddress",
+    "impossibleTravel",
+    "leakedCredentials",
+    "passwordSpray",
+    "suspiciousInboxManipulation"
+]);
+
+let HighSeverityDefenderCategories = dynamic([
+    "Malware",
+    "SuspiciousActivity",
+    "UnwantedSoftware",
+    "Ransomware",
+    "Exploit",
+    "RemoteAccessTrojan",
+    "CommandAndControl",
+    "LateralMovementTool",
+    "CredentialStealing"
+]);
+
+// --- Signal 1: Azure AD Risky Sign-ins ---
+let RiskySignins =
+    AADUserRiskEvents
+    | where TimeGenerated > ago(CorrelationWindow)
+    | where RiskDetail != "none"
+    | where RiskEventType in (HighRiskSigninCategories)
+    | extend RiskScore = case(
+        RiskLevel == "high", 3,
+        RiskLevel == "medium", 2,
+        RiskLevel == "low", 1,
+        0
+    )
+    | project
+        UserPrincipalName = tolower(UserPrincipalName),
+        RiskTime = TimeGenerated,
+        RiskEventType,
+        RiskLevel,
+        RiskScore,
+        SigninIP = IPAddress,
+        Location,
+        AdditionalInfo;
+
+// --- Signal 2: Microsoft Defender for Endpoint Alerts ---
+let DefenderAlerts =
+    DeviceAlertEvents
+    | where TimeGenerated > ago(CorrelationWindow)
+    | where AlertSeverity in ("High", "Medium")
+    | where Category in (HighSeverityDefenderCategories)
+    // Exclude known FP sources
+    | where Title !contains "Test alert"
+    | where Title !contains "Eicar"
+    | join kind=inner (
+        DeviceInfo
+        | where TimeGenerated > ago(CorrelationWindow)
+        | summarize arg_max(TimeGenerated, LoggedOnUsers) by DeviceId
+    ) on DeviceId
+    | mv-expand LoggedOnUser = parse_json(LoggedOnUsers)
+    | extend AlertUserUPN = tolower(tostring(LoggedOnUser.UserPrincipalName))
+    | where isnotempty(AlertUserUPN)
+    | project
+        DeviceName,
+        DeviceId,
+        AlertUserUPN,
+        AlertTime = TimeGenerated,
+        AlertTitle = Title,
+        AlertCategory = Category,
+        AlertSeverity,
+        MitreTechniques,
+        RemediationStatus;
+
+// --- Step 3: Correlate both signals on same user within time window ---
+RiskySignins
+| join kind=inner DefenderAlerts on $left.UserPrincipalName == $right.AlertUserUPN
+| where AlertTime between (RiskTime .. (RiskTime + totimespan(CorrelationWindow)))
+    or RiskTime between (AlertTime .. (AlertTime + totimespan(CorrelationWindow)))
+| extend
+    TimeDeltaHours = round(abs(datetime_diff('minute', AlertTime, RiskTime)) / 60.0, 1),
+    CombinedRiskScore = RiskScore + case(AlertSeverity == "High", 3, 2),
+    AttackChainSummary = strcat(
+        "1. Risky sign-in (", RiskEventType, ") from ", SigninIP,
+        " → 2. Defender alert (", AlertCategory, ": ", AlertTitle, ") on ", DeviceName
+    )
+| where CombinedRiskScore >= 4  // Require meaningful combined signal
+| project
+    TimeGenerated = coalesce(AlertTime, RiskTime),
+    UserPrincipalName,
+    AttackChainSummary,
+    RiskySigninType = RiskEventType,
+    RiskLevel,
+    SigninFromIP = SigninIP,
+    SigninLocation = Location,
+    AffectedDevice = DeviceName,
+    DefenderAlertTitle = AlertTitle,
+    DefenderCategory = AlertCategory,
+    DefenderSeverity = AlertSeverity,
+    MitreTechniques,
+    TimeBetweenSignalsHours = TimeDeltaHours,
+    CombinedRiskScore,
+    RemediationStatus
+| order by CombinedRiskScore desc, TimeGenerated desc

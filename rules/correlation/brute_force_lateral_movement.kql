@@ -1,0 +1,99 @@
+// ============================================================
+// RULE: Brute Force Success Followed by Lateral Movement
+// ============================================================
+// MITRE ATT&CK: T1110 -> T1021 (Remote Services) -> T1570 (Lateral Tool Transfer)
+// Severity: Critical
+// Version: 1.0
+//
+// ATTACKER CHAIN LOGIC:
+//   1. Attacker brute-forces or sprays passwords across multiple accounts
+//   2. Gains access to one account
+//   3. Uses that account to move laterally (SMB, WinRM, RDP, PsExec)
+//   4. Escalates by targeting admin shares or service accounts
+//
+// FALSE POSITIVE REDUCTION:
+//   - Requires lateral movement to occur on a DIFFERENT host than login
+//   - Excludes known IT admin accounts (add your admin group names below)
+//   - Excludes patch management / RMM tools by process signature
+//   - Time-bounds the chain to 2 hours
+// ============================================================
+
+let LookbackWindow = 2h;
+let BruteForceThreshold = 5;
+let AdminAccounts = dynamic(["svc-patching", "svc-backup", "svc-deploy"]);  // Add your service accounts
+let RMMProcesses = dynamic(["TeamViewer.exe", "ConnectWiseControl.exe", "SplashtopStreamer.exe"]);
+
+// --- Step 1: Identify brute force followed by successful login ---
+let CompromisedAccounts =
+    SigninLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | summarize
+        FailedLogins = countif(ResultType != "0"),
+        SuccessLogins = countif(ResultType == "0"),
+        SuccessTime = minif(TimeGenerated, ResultType == "0"),
+        UniqueTargetApps = dcount(AppDisplayName),
+        SourceIPs = make_set(IPAddress)
+        by UserPrincipalName
+    | where FailedLogins >= BruteForceThreshold
+    | where SuccessLogins >= 1
+    | where UserPrincipalName !in (AdminAccounts)
+    | project UserPrincipalName, FailedLogins, SuccessTime, UniqueTargetApps, SourceIPs;
+
+// --- Step 2: Detect lateral movement events post-compromise ---
+let LateralMovementEvents =
+    DeviceNetworkEvents
+    | where TimeGenerated > ago(LookbackWindow)
+    | where RemotePort in (445, 135, 139, 5985, 5986, 3389)  // SMB, RPC, WinRM, RDP
+    | where ActionType == "ConnectionSuccess"
+    | project
+        SourceDevice = DeviceName,
+        AccountName,
+        LateralMoveTime = TimeGenerated,
+        DestinationIP = RemoteIP,
+        DestinationPort = RemotePort,
+        Protocol = iff(RemotePort == 445, "SMB",
+                  iff(RemotePort in (5985,5986), "WinRM",
+                  iff(RemotePort == 3389, "RDP", "RPC")))
+    | union (
+        // Also check process-based lateral movement (PsExec, WMIC remoting)
+        DeviceProcessEvents
+        | where TimeGenerated > ago(LookbackWindow)
+        | where FileName in~ ("psexec.exe", "psexesvc.exe", "wmic.exe", "winrs.exe")
+        | where ProcessCommandLine has_any ("\\\\", "/node:", "computername")
+        | where FileName !in (RMMProcesses)
+        | project
+            SourceDevice = DeviceName,
+            AccountName,
+            LateralMoveTime = TimeGenerated,
+            DestinationIP = "",
+            DestinationPort = 0,
+            Protocol = strcat("ProcessBased-", FileName)
+    );
+
+// --- Step 3: Correlate compromised account with lateral movement ---
+CompromisedAccounts
+| join kind=inner (
+    LateralMovementEvents
+    | extend UserPrincipalName = tolower(strcat(AccountName, "@", "yourdomain.com"))  // Adjust domain
+) on UserPrincipalName
+| where LateralMoveTime > SuccessTime
+| where LateralMoveTime - SuccessTime < 2h
+| extend
+    ChainDurationMinutes = datetime_diff('minute', LateralMoveTime, SuccessTime),
+    SeverityScore = case(
+        Protocol == "SMB" and FailedLogins >= 20, "Critical",
+        Protocol in ("WinRM", "RDP"), "High",
+        "Medium"
+    )
+| project
+    AlertTime = LateralMoveTime,
+    UserPrincipalName,
+    BruteForceAttempts = FailedLogins,
+    CompromiseTime = SuccessTime,
+    SourceDevice,
+    LateralMovementProtocol = Protocol,
+    DestinationIP,
+    ChainDurationMinutes,
+    SeverityScore,
+    AttackerSourceIPs = SourceIPs
+| order by AlertTime desc

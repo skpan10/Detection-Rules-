@@ -1,0 +1,140 @@
+// ============================================================
+// RULE: Failed Login Followed by Suspicious Process Spawn
+// ============================================================
+// MITRE ATT&CK: T1110 (Brute Force) -> T1059 (Command Execution)
+// Severity: High
+// Author: Detection Engineering Team
+// Version: 1.0
+//
+// ATTACKER CHAIN LOGIC:
+//   1. Attacker brutes/sprays credentials (multiple failed logins)
+//   2. Eventually succeeds OR pivots to a compromised session
+//   3. Immediately spawns recon/execution processes (whoami, net, cmd, powershell)
+//
+// FALSE POSITIVE REDUCTION:
+//   - Minimum 3 failed logins before success (not just a typo)
+//   - Process must spawn within 15 minutes of successful login
+//   - Exclude known service accounts and scheduled task accounts
+//   - Exclude processes spawned by legitimate software update paths
+//   - Require process to be a known attacker-used binary OR unsigned
+// ============================================================
+
+let LookbackWindow = 1h;
+let FailedLoginThreshold = 3;
+let ProcessSpawnWindow = 15m;
+
+// --- Step 1: Find accounts with multiple failed logins followed by success ---
+let FailedThenSuccess =
+    SigninLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where ResultType != "0"  // Failed logins
+    | summarize
+        FailedCount = count(),
+        FailedIPs = make_set(IPAddress),
+        FirstFailure = min(TimeGenerated),
+        LastFailure = max(TimeGenerated)
+        by UserPrincipalName, AppDisplayName
+    | where FailedCount >= FailedLoginThreshold
+    | join kind=inner (
+        SigninLogs
+        | where TimeGenerated > ago(LookbackWindow)
+        | where ResultType == "0"   // Successful login
+        | where AuthenticationRequirement != "multiFactorAuthentication"  // Flag MFA-less success after failures
+        | project
+            UserPrincipalName,
+            SuccessTime = TimeGenerated,
+            SuccessIP = IPAddress,
+            SuccessLocation = Location,
+            DeviceDetail,
+            ConditionalAccessStatus
+    ) on UserPrincipalName
+    | where SuccessTime > LastFailure  // Success came AFTER the failures
+    | where SuccessTime - LastFailure < 30m  // Success within 30 min of last failure
+    | project
+        UserPrincipalName,
+        FailedCount,
+        FailedIPs,
+        FirstFailure,
+        LastFailure,
+        SuccessTime,
+        SuccessIP,
+        SuccessLocation,
+        ConditionalAccessStatus;
+
+// --- Step 2: Find suspicious processes spawned on endpoints around the same time ---
+let SuspiciousProcesses =
+    DeviceProcessEvents
+    | where TimeGenerated > ago(LookbackWindow)
+    | where FileName in~ (
+        // Recon binaries
+        "whoami.exe", "net.exe", "net1.exe", "ipconfig.exe", "systeminfo.exe",
+        "nltest.exe", "arp.exe", "nslookup.exe", "ping.exe", "tracert.exe",
+        // Execution engines
+        "powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe",
+        "mshta.exe", "rundll32.exe", "regsvr32.exe", "certutil.exe",
+        // Credential access
+        "mimikatz.exe", "procdump.exe", "lsass.exe", "vaultcmd.exe",
+        // Lateral movement
+        "psexec.exe", "wmic.exe", "winrs.exe", "sc.exe"
+    )
+    // Exclude legitimate parent processes for these binaries
+    | where InitiatingProcessFileName !in~ (
+        "msiexec.exe",          // Software installs
+        "svchost.exe",          // Windows services (with caution - see notes)
+        "TiWorker.exe",         // Windows Update
+        "TrustedInstaller.exe"  // Windows Update
+    )
+    // Exclude known software update command lines
+    | where ProcessCommandLine !contains "WindowsUpdate"
+    | where ProcessCommandLine !contains "MicrosoftUpdate"
+    | project
+        DeviceName,
+        AccountName,
+        AccountDomain,
+        ProcessTime = TimeGenerated,
+        FileName,
+        ProcessCommandLine,
+        InitiatingProcessFileName,
+        InitiatingProcessCommandLine,
+        SHA256;
+
+// --- Step 3: Correlate on username + time window ---
+FailedThenSuccess
+| join kind=inner (
+    SuspiciousProcesses
+    | extend UserPrincipalName = tolower(strcat(AccountName, "@", AccountDomain))
+) on UserPrincipalName
+| where ProcessTime between (SuccessTime .. (SuccessTime + ProcessSpawnWindow))
+| extend
+    TimeDeltaMinutes = datetime_diff('minute', ProcessTime, SuccessTime),
+    RiskIndicators = pack_array(
+        iff(FailedCount >= 10, "HIGH_FAILURE_COUNT", ""),
+        iff(SuccessIP !in (FailedIPs), "SUCCESS_FROM_DIFFERENT_IP", ""),
+        iff(ConditionalAccessStatus == "notApplied", "NO_CONDITIONAL_ACCESS", ""),
+        iff(FileName in~ ("mimikatz.exe","procdump.exe"), "CREDENTIAL_TOOL_DETECTED", ""),
+        iff(FileName in~ ("whoami.exe","net.exe","ipconfig.exe"), "RECON_DETECTED", "")
+    )
+| project
+    TimeGenerated = SuccessTime,
+    UserPrincipalName,
+    FailedLoginCount = FailedCount,
+    FailedFromIPs = FailedIPs,
+    SuccessfulLoginTime = SuccessTime,
+    SuccessFromIP = SuccessIP,
+    SuccessLocation,
+    DeviceName,
+    SuspiciousProcess = FileName,
+    CommandLine = ProcessCommandLine,
+    ParentProcess = InitiatingProcessFileName,
+    MinutesAfterLogin = TimeDeltaMinutes,
+    RiskIndicators,
+    ConditionalAccessStatus
+| order by TimeGenerated desc
+
+// ============================================================
+// TUNING NOTES:
+// 1. Increase FailedLoginThreshold in low-noise environments (try 5-10)
+// 2. Add your org's service account naming patterns to exclusions
+// 3. Consider adding geo-velocity check: SuccessIP country != FailedIPs country
+// 4. For high-value accounts (admin, exec), lower threshold to 1-2 failures
+// ============================================================

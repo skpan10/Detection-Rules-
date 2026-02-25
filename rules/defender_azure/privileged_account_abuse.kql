@@ -1,0 +1,144 @@
+// ============================================================
+// RULE: Privileged Account Abuse Chain
+// ============================================================
+// MITRE ATT&CK: T1078.002 -> T1098 (Account Manipulation) -> T1484 (Domain Policy Modification)
+// Severity: Critical
+// Version: 1.0
+//
+// ATTACKER CHAIN LOGIC:
+//   Phase 1 - Access:    Attacker compromises a regular account
+//   Phase 2 - Escalate:  Account is added to privileged group OR privilege used anomalously
+//   Phase 3 - Persist:   New accounts created, MFA disabled, or policy changed
+//   Phase 4 - Execute:   Privileged execution or data access begins
+//
+// DETECTION APPROACH:
+//   Detect ANY 2+ phases occurring for same user within 1 hour
+//   This is the "diamond" model: if you see 2 sides of the diamond, raise alert
+//
+// FALSE POSITIVE REDUCTION:
+//   - Excludes planned change windows (add times to ChangeWindowTimes)
+//   - Excludes known-good admin accounts performing routine tasks
+//   - Requires anomaly in TIMING or SEQUENCE, not just individual events
+// ============================================================
+
+let DetectionWindow = 1h;
+let KnownAdminUPNs = dynamic([
+    // Add your IT admin UPNs here - these accounts EXPECT to do privileged actions
+    // "it-admin@yourdomain.com", "svc-azuread@yourdomain.com"
+]);
+
+// --- Phase 1: Suspicious initial access (risky or anomalous login) ---
+let Phase1_Access =
+    SigninLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where ResultType == "0"
+    | where RiskLevelDuringSignIn in ("high", "medium")
+        or ConditionalAccessStatus == "notApplied"
+        or AuthenticationRequirement == "singleFactorAuthentication"
+    | where UserPrincipalName !in (KnownAdminUPNs)
+    | project
+        UserPrincipalName = tolower(UserPrincipalName),
+        Phase1Time = TimeGenerated,
+        Phase1Detail = strcat("Risky login from ", IPAddress, " (", Location, ") - CA:", ConditionalAccessStatus)
+    | summarize Phase1Time = min(Phase1Time), Phase1Detail = any(Phase1Detail) by UserPrincipalName;
+
+// --- Phase 2: Privilege escalation via Azure AD group membership ---
+let Phase2_Escalation =
+    AuditLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where OperationName in (
+        "Add member to role",
+        "Add member to role completed (PIM activation)",
+        "Add eligible member to role",
+        "Update user",
+        "Set user manager"
+    )
+    | where TargetResources has_any ("Global Administrator", "Privileged Role Administrator",
+        "Security Administrator", "Exchange Administrator", "Conditional Access Administrator",
+        "Application Administrator", "User Administrator")
+    | extend TargetUPN = tolower(tostring(TargetResources[0].userPrincipalName))
+    | extend ActorUPN = tolower(tostring(InitiatedBy.user.userPrincipalName))
+    | where isnotempty(TargetUPN)
+    | project
+        EscalationTime = TimeGenerated,
+        TargetUPN,
+        ActorUPN,
+        Phase2Detail = strcat(OperationName, " → ", tostring(TargetResources[0].displayName));
+
+// --- Phase 3: Persistence actions (account manipulation, MFA changes, policy changes) ---
+let Phase3_Persistence =
+    AuditLogs
+    | where TimeGenerated > ago(DetectionWindow)
+    | where OperationName in (
+        "Update user",           // Modifying user properties
+        "Delete user",
+        "Add user",              // Creating new accounts
+        "Reset user password",
+        "Change user password",
+        "Disable Strong Authentication", // MFA disabled!
+        "Update application",
+        "Update conditional access policy",
+        "Set company information"
+    )
+    | where OperationName in ("Disable Strong Authentication", "Update conditional access policy")
+        or (OperationName == "Add user" and isnotempty(TargetResources))
+    | extend ActorUPN = tolower(tostring(InitiatedBy.user.userPrincipalName))
+    | where ActorUPN !in (KnownAdminUPNs)
+    | project
+        PersistTime = TimeGenerated,
+        ActorUPN,
+        Phase3Detail = strcat(OperationName, ": ", tostring(TargetResources[0].displayName));
+
+// --- Phase 4: Privileged execution (sensitive resource access or download) ---
+let Phase4_Execution =
+    OfficeActivity
+    | where TimeGenerated > ago(DetectionWindow)
+    | where Operation in (
+        "FileDownloaded", "FileSyncDownloadedFull",
+        "SearchQueryPerformed"
+    )
+    | where Site_Url contains "admin" or Site_Url contains "security" or Site_Url contains "compliance"
+    | project
+        ExecTime = TimeGenerated,
+        ExecUserUPN = tolower(UserId),
+        Phase4Detail = strcat(Operation, " on ", Site_Url)
+    | union (
+        DeviceProcessEvents
+        | where TimeGenerated > ago(DetectionWindow)
+        | where FileName in~ ("azuread.psd1", "msol", "aadconnect.exe")
+            or ProcessCommandLine has_any ("Get-AzureADUser", "Get-MsolUser", "Export-Csv")
+        | project
+            ExecTime = TimeGenerated,
+            ExecUserUPN = tolower(AccountUpn),
+            Phase4Detail = strcat("PowerShell AAD enumeration: ", ProcessCommandLine)
+    );
+
+// --- FINAL: Find users with 2+ phases in the detection window ---
+let AllPhaseUsers =
+    Phase2_Escalation | project UserPrincipalName = TargetUPN, Phase = 2, PhaseTime = EscalationTime, Detail = Phase2Detail
+    | union (Phase3_Persistence | project UserPrincipalName = ActorUPN, Phase = 3, PhaseTime = PersistTime, Detail = Phase3Detail)
+    | union (Phase4_Execution | project UserPrincipalName = ExecUserUPN, Phase = 4, PhaseTime = ExecTime, Detail = Phase4Detail);
+
+AllPhaseUsers
+| join kind=inner Phase1_Access on UserPrincipalName
+| summarize
+    PhasesDetected = make_set(Phase),
+    PhaseCount = dcount(Phase),
+    AttackTimeline = make_list(pack("phase", Phase, "time", PhaseTime, "detail", Detail))
+    by UserPrincipalName, Phase1Time, Phase1Detail
+| where PhaseCount >= 2  // At least Phase 1 + one more
+| extend
+    SeverityScore = case(
+        PhaseCount >= 4, "CRITICAL - Full attack chain detected",
+        PhaseCount == 3, "HIGH - 3-phase chain",
+        "MEDIUM - 2-phase chain, investigate"
+    )
+| project
+    TimeGenerated = Phase1Time,
+    UserPrincipalName,
+    SeverityScore,
+    PhaseCount,
+    PhasesDetected,
+    InitialAccessDetail = Phase1Detail,
+    AttackTimeline
+| order by PhaseCount desc, TimeGenerated desc

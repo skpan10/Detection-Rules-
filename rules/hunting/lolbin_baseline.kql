@@ -1,0 +1,86 @@
+// ============================================================
+// HUNTING QUERY: Living-off-the-Land Binaries (LOLBIN) Post-Login
+// ============================================================
+// Purpose: Find LOLBIN abuse that occurs shortly after anomalous logins
+// MITRE ATT&CK: T1218 (System Binary Proxy Execution)
+// Type: Hunting (run periodically, tune to your environment)
+// Version: 1.0
+//
+// LOLBINs are legitimate Windows binaries abused by attackers because:
+//   1. They're signed by Microsoft (bypass AppLocker/WDAC)
+//   2. They can execute code in unusual ways
+//   3. They generate less suspicion in EDR telemetry
+//
+// This query hunts for LOLBIN usage that deviates from your BASELINE
+// ============================================================
+
+let HuntingWindow = 24h;
+let LOLBins = datatable(Binary:string, CommonLegitUse:string, RiskLevel:string)[
+    "certutil.exe",     "Certificate management",                       "HIGH",
+    "mshta.exe",        "HTA file execution",                          "HIGH",
+    "regsvr32.exe",     "DLL registration",                            "HIGH",
+    "rundll32.exe",     "DLL execution",                               "MEDIUM",
+    "msiexec.exe",      "MSI installation",                            "MEDIUM",
+    "wmic.exe",         "WMI queries",                                  "HIGH",
+    "cmstp.exe",        "Connection Manager profile installer",         "CRITICAL",
+    "msbuild.exe",      "Build projects",                              "HIGH",
+    "installutil.exe",  "Install .NET components",                     "HIGH",
+    "regasm.exe",       "Register .NET COM assemblies",                "HIGH",
+    "regsvcs.exe",      "Register COM+ applications",                  "HIGH",
+    "odbcconf.exe",     "ODBC configuration",                          "CRITICAL",
+    "ieexec.exe",       "Internet Explorer execution",                 "CRITICAL",
+    "xwizard.exe",      "Extensible Wizard Host Process",              "HIGH",
+    "syncappvpublishingserver.exe", "App-V publishing",                "HIGH"
+];
+
+// Suspicious command-line patterns for LOLBINs
+let SuspiciousPatterns = dynamic([
+    "http://", "https://",      // Network download
+    "\\\\",                     // UNC path (network)
+    "base64",                   // Encoded payload
+    "FromBase64",
+    "-enc", "-encodedcommand",  // Encoded PowerShell
+    "scrobj.dll",               // Script execution via regsvr32
+    "comsvcs.dll",              // LSASS dump via rundll32
+    "MiniDump",                 // Memory dump
+    "/i:", "/s /u"              // regsvr32 remote execution
+]);
+
+DeviceProcessEvents
+| where TimeGenerated > ago(HuntingWindow)
+| join kind=inner LOLBins on $left.FileName == $right.Binary
+| extend IsSuspiciousCommandLine = ProcessCommandLine has_any (SuspiciousPatterns)
+| extend
+    IsNetworkReference = ProcessCommandLine has_any ("http://", "https://", "\\\\"),
+    IsEncodedPayload = ProcessCommandLine has_any ("base64", "FromBase64", "-enc", "-encodedcommand"),
+    IsCredentialDump = ProcessCommandLine has_any ("comsvcs.dll", "MiniDump", "lsass"),
+    IsRemoteExec = ProcessCommandLine has_any ("/i:http", "scrobj.dll")
+| where IsSuspiciousCommandLine == true
+// Check if this occurred near a risky login for this device's user
+| join kind=leftouter (
+    SigninLogs
+    | where TimeGenerated > ago(HuntingWindow)
+    | where RiskLevelDuringSignIn in ("high", "medium")
+    | project RiskyLoginUser = tolower(UserPrincipalName), RiskyLoginTime = TimeGenerated
+) on $left.AccountUpn == $right.RiskyLoginUser
+| extend MinutesFromRiskyLogin = iff(isnotempty(RiskyLoginTime),
+    abs(datetime_diff('minute', TimeGenerated, RiskyLoginTime)), int(null))
+| extend PostRiskyLoginFlag = MinutesFromRiskyLogin <= 60
+| project
+    TimeGenerated,
+    DeviceName,
+    AccountName,
+    AccountUpn,
+    LOLBin = FileName,
+    LOLBinRisk = RiskLevel,
+    CommandLine = ProcessCommandLine,
+    ParentProcess = InitiatingProcessFileName,
+    ParentCommandLine = InitiatingProcessCommandLine,
+    IsNetworkReference,
+    IsEncodedPayload,
+    IsCredentialDump,
+    IsRemoteExec,
+    OccurredAfterRiskyLogin = PostRiskyLoginFlag,
+    MinutesFromRiskyLogin,
+    SHA256
+| order by LOLBinRisk asc, PostRiskyLoginFlag desc, TimeGenerated desc

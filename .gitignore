@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# Secrets / Config (NEVER commit these)
+*.env
+config/local.json
+config/secrets.json
+.workspace_id
+.tenant_id
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+tests/output/
+*.log

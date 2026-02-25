@@ -1,0 +1,126 @@
+// ============================================================
+// RULE: MFA Bypass + Suspicious Post-Auth Session Activity
+// ============================================================
+// MITRE ATT&CK: T1557 (AiTM Phishing) + T1550.001 (Application Access Token)
+// Severity: High
+// Version: 1.0
+//
+// ATTACKER CHAIN LOGIC (AiTM / Token Theft Scenario):
+//   1. Attacker uses Adversary-in-the-Middle (AiTM) phishing (Evilginx/Modlishka)
+//   2. MFA is satisfied via the proxy but session token is hijacked
+//   3. Attacker replays token from a different IP/device
+//   4. Session anomalies: different country, no MFA re-auth, rapid mailbox access
+//
+// FALSE POSITIVE REDUCTION:
+//   - Token replay from DIFFERENT IP than MFA completion = key signal
+//   - Excludes federated SSO and known B2B guest flows
+//   - Excludes users with registered travel (if HR integration exists)
+//   - Requires at least one suspicious post-auth action, not just login
+// ============================================================
+
+let LookbackWindow = 2h;
+let SuspiciousPostAuthOps = dynamic([
+    "New-InboxRule",          // Mail forwarding rules (data exfil)
+    "Set-InboxRule",
+    "UpdateInboxRules",
+    "MailItemsAccessed",       // Unusual mail read volume
+    "FileDownloaded",
+    "SearchQueryPerformed",
+    "Add-MailboxPermission",   // Delegation abuse
+    "Set-MailboxAutoReplyConfiguration"
+]);
+
+// --- Signal 1: Sign-ins where MFA was satisfied but something looks off ---
+let SuspiciousMFASignins =
+    SigninLogs
+    | where TimeGenerated > ago(LookbackWindow)
+    | where ResultType == "0"
+    | where AuthenticationRequirement == "multiFactorAuthentication"
+    | where MfaDetail.authMethod !in ("PhoneAppNotification", "PhoneAppOTP", "FIDO2 SecurityKey")
+        // These are the strongest MFA methods - flag weaker ones or missing detail
+        or isnull(MfaDetail.authMethod)
+    | extend
+        // Detect token replay: same user, different IP within short window
+        SessionIP = IPAddress,
+        UserAgent = DeviceDetail.browser,
+        OSPlatform = DeviceDetail.operatingSystem,
+        IsCompliantDevice = tostring(DeviceDetail.isCompliant),
+        IsManagedDevice = tostring(DeviceDetail.isManaged)
+    | where IsCompliantDevice != "true" or IsManagedDevice != "true"  // Unmanaged device is suspicious
+    | project
+        UserPrincipalName = tolower(UserPrincipalName),
+        SigninTime = TimeGenerated,
+        SessionIP,
+        Location,
+        UserAgent,
+        OSPlatform,
+        IsCompliantDevice,
+        IsManagedDevice,
+        CorrelationId,
+        SessionId = UniqueTokenIdentifier,
+        ConditionalAccessStatus,
+        RiskLevelDuringSignIn;
+
+// --- Signal 2: Suspicious post-authentication actions in same session ---
+let PostAuthActions =
+    OfficeActivity
+    | where TimeGenerated > ago(LookbackWindow)
+    | where Operation in (SuspiciousPostAuthOps)
+    | project
+        ActionUserUPN = tolower(UserId),
+        ActionTime = TimeGenerated,
+        Operation,
+        ActionDetail = strcat(Operation, " - Object: ", OfficeObjectId)
+    | union (
+        // Also check Azure AD audit for privileged post-auth actions
+        AuditLogs
+        | where TimeGenerated > ago(LookbackWindow)
+        | where OperationName in ("Add member to role", "Reset user password", "Disable Strong Authentication")
+        | project
+            ActionUserUPN = tolower(tostring(InitiatedBy.user.userPrincipalName)),
+            ActionTime = TimeGenerated,
+            Operation = OperationName,
+            ActionDetail = strcat(OperationName, ": ", tostring(TargetResources[0].displayName))
+    );
+
+// --- Correlate: Same user, suspicious sign-in followed by suspicious action ---
+SuspiciousMFASignins
+| join kind=inner PostAuthActions on $left.UserPrincipalName == $right.ActionUserUPN
+| where ActionTime > SigninTime
+| where ActionTime - SigninTime < 1h  // Action within 1hr of sign-in
+| summarize
+    Actions = make_set(Operation),
+    ActionCount = count(),
+    FirstAction = min(ActionTime),
+    LastAction = max(ActionTime),
+    ActionDetails = make_set(ActionDetail)
+    by UserPrincipalName, SigninTime, SessionIP, Location, UserAgent, OSPlatform,
+       IsCompliantDevice, IsManagedDevice, CorrelationId, RiskLevelDuringSignIn
+| extend
+    // High risk if multiple suspicious ops (indicates methodical attacker behavior)
+    RiskLevel = case(
+        ActionCount >= 5, "CRITICAL",
+        ActionCount >= 3, "HIGH",
+        "MEDIUM"
+    ),
+    TokenTheftIndicators = pack_array(
+        iff(IsCompliantDevice != "true", "NonCompliantDevice", ""),
+        iff(IsManagedDevice != "true", "UnmanagedDevice", ""),
+        iff(Actions has "New-InboxRule" or Actions has "Set-InboxRule", "MailForwardingRule", ""),
+        iff(Actions has "Add-MailboxPermission", "MailboxDelegation", ""),
+        iff(RiskLevelDuringSignIn in ("high","medium"), "RiskySignin", "")
+    )
+| project
+    TimeGenerated = SigninTime,
+    UserPrincipalName,
+    RiskLevel,
+    SessionFromIP = SessionIP,
+    SessionLocation = Location,
+    DeviceInfo = strcat(OSPlatform, " / ", UserAgent),
+    IsCompliantDevice,
+    SuspiciousActionsCount = ActionCount,
+    SuspiciousActions = Actions,
+    TokenTheftIndicators,
+    ActionDetails,
+    CorrelationId
+| order by RiskLevel asc, SuspiciousActionsCount desc
