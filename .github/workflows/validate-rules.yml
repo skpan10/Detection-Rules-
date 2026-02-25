@@ -1,0 +1,281 @@
+name: 🛡️ Detection Rules CI
+
+on:
+  push:
+    branches: [ main, dev ]
+    paths:
+      - 'rules/**'
+      - 'scripts/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'rules/**'
+      - 'scripts/**'
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Validate rule metadata & structure
+  # ─────────────────────────────────────────────
+  validate-rules:
+    name: 📋 Validate Rule Metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: pip install colorama tabulate
+
+      - name: 🔍 Run rule validator
+        run: |
+          python scripts/validate_rules.py --dir rules/
+        continue-on-error: false
+
+      - name: 📊 Rule count summary
+        run: |
+          echo "## 📊 Rule Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Category | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Correlation Rules | $(ls rules/correlation/*.kql 2>/dev/null | wc -l) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Defender + Azure AD Rules | $(ls rules/defender_azure/*.kql 2>/dev/null | wc -l) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Hunting Queries | $(ls rules/hunting/*.kql 2>/dev/null | wc -l) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Total** | **$(find rules/ -name '*.kql' | wc -l)** |" >> $GITHUB_STEP_SUMMARY
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Check MITRE ATT&CK coverage
+  # ─────────────────────────────────────────────
+  mitre-coverage:
+    name: 🎯 MITRE ATT&CK Coverage Check
+    runs-on: ubuntu-latest
+    needs: validate-rules
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 🎯 Extract and report MITRE coverage
+        run: |
+          python3 << 'EOF'
+          import os, re, sys
+
+          rules_dir = "rules"
+          mitre_pattern = re.compile(r"T\d{4}(?:\.\d{3})?")
+          techniques = {}
+          rules_without_mitre = []
+
+          for root, dirs, files in os.walk(rules_dir):
+              for f in files:
+                  if f.endswith(".kql"):
+                      path = os.path.join(root, f)
+                      with open(path) as fh:
+                          content = fh.read()
+                      found = mitre_pattern.findall(content)
+                      if found:
+                          for t in set(found):
+                              techniques.setdefault(t, []).append(f)
+                      else:
+                          rules_without_mitre.append(f)
+
+          print(f"\n{'='*55}")
+          print(f"  🎯 MITRE ATT&CK COVERAGE REPORT")
+          print(f"{'='*55}")
+          print(f"  Unique techniques covered : {len(techniques)}")
+          print(f"  Rules with MITRE mapping  : {sum(len(v) for v in techniques.values())}")
+          print(f"\n  Techniques detected:")
+          for t, rules in sorted(techniques.items()):
+              print(f"    ✅  {t}  →  {', '.join(rules)}")
+
+          if rules_without_mitre:
+              print(f"\n  ⚠️  Rules missing MITRE mapping:")
+              for r in rules_without_mitre:
+                  print(f"    ❌  {r}")
+              sys.exit(1)
+          else:
+              print(f"\n  ✅  All rules have MITRE ATT&CK mappings!")
+          EOF
+
+      - name: 📝 Write MITRE summary to job
+        run: |
+          TECHNIQUE_COUNT=$(grep -rh "T[0-9]\{4\}" rules/ | grep -oP "T\d{4}(?:\.\d{3})?" | sort -u | wc -l)
+          echo "## 🎯 MITRE ATT&CK Coverage" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**$TECHNIQUE_COUNT unique techniques** mapped across all rules." >> $GITHUB_STEP_SUMMARY
+
+  # ─────────────────────────────────────────────
+  # JOB 3: KQL syntax & quality checks
+  # ─────────────────────────────────────────────
+  kql-quality:
+    name: 🔬 KQL Quality Checks
+    runs-on: ubuntu-latest
+    needs: validate-rules
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔬 Run KQL quality checks
+        run: |
+          python3 << 'EOF'
+          import os, re, sys
+
+          rules_dir = "rules"
+          errors = []
+          warnings = []
+
+          DANGEROUS_PATTERNS = [
+              (r"ago\(30d\)", "Very long lookback (30d) may cause performance issues - use 24h or less for production"),
+              (r"\|\s*take\s+\d+$", "Rule ends with 'take' - ensure this is intentional for hunting queries"),
+          ]
+
+          GOOD_PATTERNS = [
+              (r"\|\s*order by", "Has order by clause"),
+              (r"let\s+\w+Window", "Has explicit time window variable"),
+              (r"\|\s*project\b", "Uses project to limit columns"),
+          ]
+
+          REQUIRED_COMMENTS = [
+              "ATTACKER CHAIN LOGIC",
+              "FALSE POSITIVE REDUCTION",
+          ]
+
+          files_checked = 0
+          for root, dirs, files in os.walk(rules_dir):
+              for f in files:
+                  if not f.endswith(".kql"):
+                      continue
+                  files_checked += 1
+                  path = os.path.join(root, f)
+                  with open(path) as fh:
+                      content = fh.read()
+
+                  # Check for dangerous patterns
+                  for pattern, msg in DANGEROUS_PATTERNS:
+                      if re.search(pattern, content, re.IGNORECASE):
+                          warnings.append(f"⚠️  [{f}] {msg}")
+
+                  # Check required documentation comments
+                  for comment in REQUIRED_COMMENTS:
+                      if comment not in content:
+                          errors.append(f"❌  [{f}] Missing required comment block: '{comment}'")
+
+                  # Check for good practices
+                  missing_good = []
+                  for pattern, desc in GOOD_PATTERNS:
+                      if not re.search(pattern, content, re.IGNORECASE):
+                          missing_good.append(desc)
+
+          print(f"\n{'='*55}")
+          print(f"  🔬 KQL QUALITY REPORT")
+          print(f"{'='*55}")
+          print(f"  Files checked: {files_checked}")
+
+          if warnings:
+              print(f"\n  Warnings ({len(warnings)}):")
+              for w in warnings:
+                  print(f"  {w}")
+
+          if errors:
+              print(f"\n  Errors ({len(errors)}):")
+              for e in errors:
+                  print(f"  {e}")
+              print(f"\n  ❌ Quality check FAILED")
+              sys.exit(1)
+          else:
+              print(f"\n  ✅ All {files_checked} rules passed quality checks!")
+          EOF
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Security scan (no secrets in rules)
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: 🔐 Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔐 Scan for accidentally committed secrets
+        run: |
+          python3 << 'EOF'
+          import os, re, sys
+
+          SECRET_PATTERNS = [
+              (r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "Possible GUID/workspace ID (use env vars instead)"),
+              (r"(?i)password\s*=\s*['\"][^'\"]{6,}", "Hardcoded password"),
+              (r"(?i)api[_-]?key\s*=\s*['\"][^'\"]{10,}", "Hardcoded API key"),
+              (r"(?i)secret\s*=\s*['\"][^'\"]{6,}", "Hardcoded secret"),
+              (r"Bearer\s+[A-Za-z0-9\-_\.]{20,}", "Bearer token"),
+          ]
+
+          # Files to scan (exclude .git)
+          scan_dirs = ["rules", "scripts", "docs"]
+          found_secrets = []
+
+          for d in scan_dirs:
+              if not os.path.exists(d):
+                  continue
+              for root, dirs, files in os.walk(d):
+                  for f in files:
+                      path = os.path.join(root, f)
+                      try:
+                          with open(path) as fh:
+                              for i, line in enumerate(fh, 1):
+                                  for pattern, label in SECRET_PATTERNS:
+                                      if re.search(pattern, line):
+                                          found_secrets.append(f"  ⚠️  {path}:{i} - {label}")
+                      except:
+                          pass
+
+          print(f"\n{'='*55}")
+          print(f"  🔐 SECURITY SCAN REPORT")
+          print(f"{'='*55}")
+
+          if found_secrets:
+              print(f"\n  Potential secrets found ({len(found_secrets)}):")
+              for s in found_secrets:
+                  print(s)
+              print(f"\n  ⚠️  Review the above findings.")
+              # Warning only, don't fail - GUIDs appear in comments
+          else:
+              print(f"\n  ✅ No secrets detected in rule files!")
+          EOF
+
+  # ─────────────────────────────────────────────
+  # JOB 5: Final status badge summary
+  # ─────────────────────────────────────────────
+  ci-summary:
+    name: ✅ CI Summary
+    runs-on: ubuntu-latest
+    needs: [validate-rules, mitre-coverage, kql-quality, security-scan]
+    if: always()
+
+    steps:
+      - name: ⬇️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 📋 Write final CI summary
+        run: |
+          echo "## ✅ Detection Rules CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Rule Metadata Validation | ${{ needs.validate-rules.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| MITRE ATT&CK Coverage | ${{ needs.mitre-coverage.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| KQL Quality Checks | ${{ needs.kql-quality.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ${{ needs.security-scan.result == 'success' && '✅ Passed' || '⚠️ Review' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "*Powered by Detection Rules CI — built for production Microsoft Sentinel*" >> $GITHUB_STEP_SUMMARY
