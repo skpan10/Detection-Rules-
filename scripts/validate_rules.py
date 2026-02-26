@@ -34,8 +34,10 @@ def validate_rule(filepath: str) -> list[str]:
     
     # Check for hardcoded tenant/domain values that should be parameterized
     if re.search(r"@[a-zA-Z0-9-]+\.(com|org|net|io)\b", content):
-        if "yourdomain.com" not in content:  # Only warn if not already using placeholder
+        if "yourdomain.com" not in content:
             errors.append("WARNING: Possible hardcoded domain found. Use 'yourdomain.com' placeholder.")
+            total_warnings += 1
+            continue
     
     # Check for time window definition
     if "let LookbackWindow" not in content and "let HuntingWindow" not in content:
@@ -99,6 +101,9 @@ def main():
     
     if total_errors > 0:
         sys.exit(1)
+    else:
+        print("\n✅ All rules passed validation!")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
