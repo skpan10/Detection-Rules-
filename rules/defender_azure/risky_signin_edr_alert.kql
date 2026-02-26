@@ -12,10 +12,11 @@
 //      on the same user's device (malware, suspicious script, etc.)
 //   3. Combined = confirmed compromise, not just a risky login anomaly
 //
-// WHY THIS REDUCES FALSE POSITIVES:
+// FALSE POSITIVE REDUCTION:
 //   - Risky sign-ins alone have ~40% FP rate (VPNs, travel, new device)
 //   - Defender alerts alone on a device might be pre-existing unrelated malware
 //   - BOTH together on SAME user within short window = high confidence
+//   - Combined score threshold (>=4) filters low-signal combinations
 // ============================================================
 
 let CorrelationWindow = 4h;

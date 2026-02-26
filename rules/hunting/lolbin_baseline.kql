@@ -1,17 +1,24 @@
 // ============================================================
 // HUNTING QUERY: Living-off-the-Land Binaries (LOLBIN) Post-Login
 // ============================================================
+// RULE: LOLBIN Abuse Post Anomalous Login
 // Purpose: Find LOLBIN abuse that occurs shortly after anomalous logins
 // MITRE ATT&CK: T1218 (System Binary Proxy Execution)
+// Severity: High
 // Type: Hunting (run periodically, tune to your environment)
 // Version: 1.0
 //
-// LOLBINs are legitimate Windows binaries abused by attackers because:
-//   1. They're signed by Microsoft (bypass AppLocker/WDAC)
-//   2. They can execute code in unusual ways
-//   3. They generate less suspicion in EDR telemetry
+// ATTACKER CHAIN LOGIC:
+//   1. Attacker gains access via compromised credentials or phishing
+//   2. Uses legitimate Windows binaries (LOLBINs) to avoid detection
+//   3. LOLBINs execute payloads, download tools, or dump credentials
+//   4. Activity is correlated with prior anomalous/risky login events
 //
-// This query hunts for LOLBIN usage that deviates from your BASELINE
+// FALSE POSITIVE REDUCTION:
+//   - Filters for suspicious command-line patterns only (network refs, encoding)
+//   - Excludes known legitimate parent processes (msiexec, TrustedInstaller)
+//   - Correlates with risky login events to raise confidence
+//   - Hunting query - results require analyst review before action
 // ============================================================
 
 let HuntingWindow = 24h;
