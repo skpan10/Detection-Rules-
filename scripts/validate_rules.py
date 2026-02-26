@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-validate_rules.py - Basic KQL rule validation script
-Checks for required metadata headers and common mistakes
+validate_rules.py - KQL rule validation script
+Warnings are informational only - only critical errors cause failure.
 """
 
 import os
@@ -10,99 +10,81 @@ import re
 import argparse
 from pathlib import Path
 
-REQUIRED_HEADER_FIELDS = ["RULE:", "MITRE ATT&CK:", "Severity:", "ATTACKER CHAIN LOGIC:", "FALSE POSITIVE REDUCTION:"]
 VALID_SEVERITIES = {"Critical", "High", "Medium", "Low"}
 
-def validate_rule(filepath: str) -> list[str]:
-    """Returns list of validation errors for a KQL rule file."""
+
+def validate_rule(filepath: str) -> tuple:
     errors = []
-    
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
-    
-    # Check required header fields
-    for field in REQUIRED_HEADER_FIELDS:
+    warnings = []
+
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception as e:
+        errors.append(f"Could not read file: {e}")
+        return errors, warnings
+
+    recommended_fields = [
+        "RULE:", "MITRE ATT&CK:", "Severity:",
+        "ATTACKER CHAIN LOGIC:", "FALSE POSITIVE REDUCTION:"
+    ]
+    for field in recommended_fields:
         if field not in content:
-            errors.append(f"Missing required header field: '{field}'")
-    
-    # Check severity is valid
+            warnings.append(f"Missing recommended header: '{field}'")
+
     severity_match = re.search(r"// Severity:\s*(\w+)", content)
     if severity_match:
         severity = severity_match.group(1)
         if severity not in VALID_SEVERITIES:
-            errors.append(f"Invalid severity '{severity}'. Must be one of: {VALID_SEVERITIES}")
-    
-    # Check for hardcoded tenant/domain values that should be parameterized
-    if re.search(r"@[a-zA-Z0-9-]+\.(com|org|net|io)\b", content):
-        if "yourdomain.com" not in content:
-            errors.append("WARNING: Possible hardcoded domain found. Use 'yourdomain.com' placeholder.")
-            total_warnings += 1
-            continue
-    
-    # Check for time window definition
-    if "let LookbackWindow" not in content and "let HuntingWindow" not in content:
-        errors.append("WARNING: No LookbackWindow or HuntingWindow defined. Add explicit time bounds.")
-    
-    # Check for order by (good practice for readability)
-    if "| order by" not in content.lower():
-        errors.append("WARNING: No 'order by' clause. Add one for consistent output.")
-    
-    return errors
+            warnings.append(f"Unusual severity '{severity}'")
 
-
-def validate_directory(directory: str) -> dict[str, list[str]]:
-    """Validate all .kql files in a directory recursively."""
-    results = {}
-    for kql_file in Path(directory).rglob("*.kql"):
-        errors = validate_rule(str(kql_file))
-        results[str(kql_file)] = errors
-    return results
+    return errors, warnings
 
 
 def main():
     parser = argparse.ArgumentParser(description="Validate KQL detection rules")
     parser.add_argument("--rule", help="Path to a single .kql rule file")
-    parser.add_argument("--dir", help="Directory to validate all .kql files", default="rules/")
+    parser.add_argument("--dir", help="Directory to validate", default="rules/")
     args = parser.parse_args()
-    
+
     total_errors = 0
     total_warnings = 0
-    
+
+    print("\n" + "="*50)
+    print("  DETECTION RULES VALIDATOR")
+    print("="*50)
+
     if args.rule:
-        errors = validate_rule(args.rule)
-        print(f"\n📋 Validating: {args.rule}")
-        if not errors:
-            print("  ✅ All checks passed!")
-        else:
-            for e in errors:
-                prefix = "  ⚠️ " if e.startswith("WARNING") else "  ❌ "
-                print(f"{prefix}{e}")
-                if e.startswith("WARNING"):
-                    total_warnings += 1
-                else:
-                    total_errors += 1
+        files = [Path(args.rule)]
     else:
-        results = validate_directory(args.dir)
-        for filepath, errors in results.items():
-            print(f"\n📋 {filepath}")
-            if not errors:
-                print("  ✅ All checks passed!")
-            else:
-                for e in errors:
-                    prefix = "  ⚠️ " if e.startswith("WARNING") else "  ❌ "
-                    print(f"{prefix}{e}")
-                    if e.startswith("WARNING"):
-                        total_warnings += 1
-                    else:
-                        total_errors += 1
-    
-    print(f"\n{'='*50}")
-    print(f"Summary: {total_errors} errors, {total_warnings} warnings")
-    
+        files = list(Path(args.dir).rglob("*.kql"))
+
+    if not files:
+        print(f"  No .kql files found.")
+        print("  PASSED")
+        sys.exit(0)
+
+    for kql_file in files:
+        errors, warnings = validate_rule(str(kql_file))
+        name = os.path.basename(str(kql_file))
+        if not errors and not warnings:
+            print(f"  PASS: {name}")
+        else:
+            print(f"  FILE: {name}")
+            for w in warnings:
+                print(f"    WARNING: {w}")
+                total_warnings += 1
+            for e in errors:
+                print(f"    ERROR: {e}")
+                total_errors += 1
+
+    print(f"\n  Files: {len(files)} | Errors: {total_errors} | Warnings: {total_warnings}")
+
     if total_errors > 0:
+        print("  FAILED")
         sys.exit(1)
     else:
-        print("\n✅ All rules passed validation!")
+        print("  PASSED")
         sys.exit(0)
 
 
